@@ -126,7 +126,10 @@ def get_tickets():
 
 def find_ticket(tickets, device):
     for t in tickets:
-    
+        if t.get("device_name") == device["Device Name"] and t.get("issue_type") == ISSUE_TYPE:
+            return t
+    return None
+
 
 def create_ticket(device):
     payload = json.dumps({
@@ -241,6 +244,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        if t.get("device_name") == device["Device Name"] and t.get("issue_type") == ISSUE_TYPE:
-            return t
-    return None
