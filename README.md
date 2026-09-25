@@ -1,263 +1,103 @@
-import csv
+import json
 import os
-import re
-import shutil
-import subprocess
 import sys
+import urllib.error
+import urllib.request
+from config import HELPDESK_BASE_URL, HELPDESK_TOKEN
 
-from config import (
-    VYOS_SSH_HOST,
-    VYOS_SSH_PORT,
-    VYOS_USERNAME,
-    VYOS_PASSWORD,
-)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from enumerate_devices import enumerate_devices
+from monitor_device_availability import has_static_ip, ping_device
 
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE = os.path.join(SCRIPT_DIR, "network_devices.csv")
-
-IP_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+CSV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "network_devices.csv")
+TICKET_URL = f"{HELPDESK_BASE_URL}/api/tickets"
+ISSUE_TYPE = "Device Unavailable"
 
 
-def enumerate_devices(csv_path):
-    devices = []
+def create_ticket(device):
+    payload = json.dumps({
+        "device_name": device["Device Name"],
+        "ip_address": device["Device Address"],
+        "issue_type": ISSUE_TYPE,
+    }).encode()
 
-    with open(csv_path, newline="") as f:
-        for row in csv.DictReader(f):
-            devices.append(row)
-
-    # Find devices whose address comes from DHCP
-    dhcp_rows = [
-        device
-        for device in devices
-        if device["Device Address"].strip().upper() == "DHCP"
-    ]
-
-    if not dhcp_rows:
-        return devices
-
-    try:
-        leases = get_dhcp_leases()
-
-    except Exception as exc:
-        print(
-            f"[WARN] DHCP lookup failed; "
-            f"{len(dhcp_rows)} DHCP device(s) will remain unresolved: {exc}",
-            file=sys.stderr,
-        )
-        return devices
-
-    # Replace DHCP with the currently assigned address
-    for row in dhcp_rows:
-        device_name = row["Device Name"].strip().lower()
-
-        resolved = leases.get(device_name)
-
-        if resolved:
-            row["Device Address"] = resolved
-        else:
-            print(
-                f"[WARN] No DHCP lease found for "
-                f"'{row['Device Name']}'.",
-                file=sys.stderr,
-            )
-
-    return devices
-
-
-def print_devices(devices):
-    header = (
-        f"{'Device ID':<12} "
-        f"{'Name':<14} "
-        f"{'Address':<16} "
-        f"{'Subnet Mask':<18} "
-        f"{'Location':<12} "
-        f"{'Port':<6} "
-        f"{'OS':<14}"
-    )
-
-    print("=" * len(header))
-    print(header)
-    print("-" * len(header))
-
-    for device in devices:
-        print(
-            f"{device['Device ID']:<12} "
-            f"{device['Device Name']:<14} "
-            f"{device['Device Address']:<16} "
-            f"{device['Subnet Mask']:<18} "
-            f"{device['Location']:<12} "
-            f"{device['Access Port']:<6} "
-            f"{device['OS']:<14}"
-        )
-
-    print("=" * len(header))
-    print(f"Total devices: {len(devices)}")
-
-
-def get_dhcp_leases():
-    """
-    Retrieve the current DHCP lease table from ROUTER1.
-    """
-
-    if shutil.which("sshpass") and VYOS_PASSWORD:
-        output = _run_leases_via_sshpass()
-    else:
-        output = _run_leases_via_paramiko()
-
-    return parse_leases(output)
-
-
-def _vyos_script():
-    """
-    Commands sent to VyOS through vbash.
-    """
-    return """source /opt/vyatta/etc/functions/script-template
-run show dhcp server leases
-exit
-"""
-
-
-def _run_leases_via_sshpass():
-    argv = [
-        "sshpass",
-        "-p",
-        VYOS_PASSWORD,
-        "ssh",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "ConnectTimeout=5",
-        "-p",
-        str(VYOS_SSH_PORT),
-        f"{VYOS_USERNAME}@{VYOS_SSH_HOST}",
-        "vbash -s",
-    ]
-
-    try:
-        result = subprocess.run(
-            argv,
-            input=_vyos_script(),
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"SSH to {VYOS_USERNAME}@"
-            f"{VYOS_SSH_HOST}:{VYOS_SSH_PORT} timed out"
-        ) from exc
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"SSH to {VYOS_USERNAME}@"
-            f"{VYOS_SSH_HOST}:{VYOS_SSH_PORT} failed: "
-            f"{result.stderr.strip() or result.returncode}"
-        )
-
-    return result.stdout
-
-
-def _run_leases_via_paramiko():
-    try:
-        import paramiko
-
-    except ImportError as exc:
-        raise RuntimeError(
-            "Neither sshpass nor paramiko is available."
-        ) from exc
-
-    client = paramiko.SSHClient()
-
-    client.set_missing_host_key_policy(
-        paramiko.AutoAddPolicy()
+    req = urllib.request.Request(
+        TICKET_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {HELPDESK_TOKEN}",
+        },
+        method="POST",
     )
 
     try:
-        client.connect(
-            hostname=VYOS_SSH_HOST,
-            port=int(VYOS_SSH_PORT),
-            username=VYOS_USERNAME,
-            password=VYOS_PASSWORD,
-            timeout=10,
-            allow_agent=False,
-            look_for_keys=False,
-        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                return resp.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return resp.status, {"message": raw}
 
-        # IMPORTANT:
-        # VyOS operational commands must be run through vbash.
-        stdin, stdout, stderr = client.exec_command(
-            "vbash -s",
-            timeout=10,
-        )
+    except urllib.error.HTTPError as e:
+        # Read the error body safely even if it is not valid JSON (e.g. 500/502 HTML pages)
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, {"error": raw.strip()}
 
-        stdin.write(_vyos_script())
-        stdin.flush()
-
-        # Tell VyOS there is no more input
-        stdin.channel.shutdown_write()
-
-        output = stdout.read().decode(
-            errors="replace"
-        )
-
-        errors = stderr.read().decode(
-            errors="replace"
-        ).strip()
-
-        if not output.strip() and errors:
-            raise RuntimeError(
-                f"VyOS DHCP command failed: {errors}"
-            )
-
-        return output
-
-    finally:
-        client.close()
-
-
-def parse_leases(output):
-    """
-    Convert the VyOS DHCP table into:
-
-    {
-        "pc1": "192.168.10.101",
-        "pc2": "192.168.20.100",
-        ...
-    }
-    """
-    leases = {}
-
-    for line in output.splitlines():
-        tokens = line.split()
-
-        # A valid lease row has many columns.
-        if len(tokens) < 3:
-            continue
-
-        ip = tokens[0]
-
-        # Ignore headings and separator lines
-        if not IP_PATTERN.match(ip):
-            continue
-
-        # VyOS columns end with:
-        # Pool Hostname Origin
-        hostname = tokens[-2].strip().lower()
-
-        if not hostname or hostname == "hostname":
-            continue
-
-        leases[hostname] = ip
-
-    return leases
+    except urllib.error.URLError as e:
+        return None, {"error": str(e.reason)}
 
 
 def main():
     devices = enumerate_devices(CSV_FILE)
 
-    print_devices(devices)
+    print("=" * 65)
+    print("DEVICE UNAVAILABILITY TICKETING")
+    print(f"Issue type: {ISSUE_TYPE}")
+    print(f"Ticket service: {TICKET_URL}")
+    print("=" * 65)
+
+    created = 0
+    failed = 0
+
+    for d in devices:
+        address = d["Device Address"]
+        if not has_static_ip(address):
+            print(f"[SKIP] {d['Device Name']:<8} | {address:<18} | No static IP (not monitored)")
+            continue
+        if not ping_device(address):
+            name = d["Device Name"]
+            status, response = create_ticket(d)
+
+            if status == 201:
+                ticket = response.get("ticket_id", "?")
+                print(f"[OK]   Ticket #{ticket} | {name:<8} | {address:<18} | {response.get('message', '')}")
+                created += 1
+            else:
+                # ----------------- ERROR EXTRACTION -----------------
+                # Check all typical error keys used by REST APIs
+                if isinstance(response, dict):
+                    err_msg = (
+                        response.get("error")
+                        or response.get("message")
+                        or response.get("detail")
+                        or response.get("errors")
+                        or str(response)
+                    )
+                else:
+                    err_msg = str(response)
+
+                status_prefix = f"HTTP {status}: " if status else "Network Error: "
+                print(f"[FAIL] {name:<8} | {address:<18} | {status_prefix}{err_msg}")
+                # ----------------------------------------------------
+                failed += 1
+
+    print("-" * 65)
+    print(f"Total: {created} tickets created, {failed} failed")
+    print("=" * 65)
 
 
 if __name__ == "__main__":
